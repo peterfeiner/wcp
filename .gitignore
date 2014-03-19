@@ -1,0 +1,5 @@
+*.o
+*.pyc
+.*.un~
+build/
+wcp.data

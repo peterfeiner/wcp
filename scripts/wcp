@@ -1,0 +1,3 @@
+#!/usr/bin/env python
+import wcp.cli
+wcp.cli.main()
