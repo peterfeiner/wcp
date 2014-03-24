@@ -19,6 +19,12 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
 
 #if 0
 static int
@@ -211,7 +217,14 @@ static PyMethodDef ProfMethods[] = {
 
 #endif
 
+static void wcp_unregister_signal_handler(int sig);
+
+#define WCP_DEBUG 2
+#define WCP_INFO 1
+#define WCP_ERROR 0
+
 static int wcp_log_fd = 2;
+static int wcp_log_level = WCP_ERROR;
 
 static pid_t
 gettid(void) {
@@ -233,11 +246,23 @@ wcp_log_printf(const char *fmt, ...) {
     return r;
 }
 
-#define WCP_LOG(fmt, args...)\
-    wcp_log_printf("wcp [%d:%d] at " __FILE__ ":%d: " fmt "\n", getpid(), gettid(), __LINE__, ## args)
+#define WCP_LOG(level, fmt, args...) do {\
+    if ((level) <= wcp_log_level) {\
+        const char *level_name;\
+        switch (level) {\
+            case WCP_DEBUG: level_name = "debug"; break;\
+            case WCP_INFO: level_name = "info "; break;\
+            case WCP_ERROR: level_name = "error"; break;\
+            default: level_name = "?    ";\
+        }\
+        wcp_log_printf("wcp %s [%d:%d] at " __FILE__ ":%d in %s: " fmt "\n",\
+                       level_name, getpid(), gettid(), __LINE__, __FUNCTION__, \
+                       ## args);\
+    }\
+} while (0)
 
 #define WCP_ABORT(fmt, args...) do {\
-    WCP_LOG(fmt, ## args);\
+    WCP_LOG(WCP_ERROR, fmt, ## args);\
     abort();\
 } while (0)
 
@@ -399,7 +424,7 @@ wcp_find_current_tstate(void)
     int threads_seen = 0;
     PyInterpreterState *interp = PyInterpreterState_Head();
 
-    WCP_LOG("currently %d threads", thread_count);
+    WCP_LOG(WCP_DEBUG, "currently %d threads", thread_count);
 
     for (; interp; interp = PyInterpreterState_Next(interp))
     {
@@ -447,17 +472,293 @@ wcp_get_thread_id(PyObject *self, PyObject *args)
     return PyLong_FromLong(tstate->thread_id);
 }
 
+static PyObject *
+wcp_raise_os_error(const char *fmt, ...)
+{
+    char *msg;
+    PyObject *v;
+    int r;
+    int i = errno;
+
+    va_list ap;
+    va_start(ap, fmt);
+    r = vasprintf(&msg, fmt, ap);
+    va_end(ap);
+
+    if (r)
+        return PyErr_NoMemory();
+
+    v = Py_BuildValue("(is)", i, msg);
+    free(msg);
+
+    if (v == NULL)
+        return PyErr_NoMemory();
+
+    PyErr_SetObject(PyExc_OSError, v);
+    Py_DECREF(v);
+
+    return NULL;
+}
+
+static void
+wcp_invoke_default_handler(int sig)
+{
+    sigset_t mask;
+    wcp_unregister_signal_handler(sig);
+    sigfillset(&mask);
+    sigdelset(&mask, sig);
+    raise(sig);
+    sigsuspend(&mask);
+};
+
+static void
+wcp_handle_fault(int sig, siginfo_t *info, struct ucontext *ucontext)
+{
+    WCP_LOG(WCP_DEBUG, "handling fault %d, try_depth is %d",
+            sig, wcp_current.try_depth);
+    WCP_ASSERT(sig == SIGSEGV || sig == SIGBUS);
+    if (wcp_current.try_depth == 0) {
+        WCP_LOG(WCP_ERROR, "received signal %d when try_depth is 0; aborting",
+                sig);
+        wcp_invoke_default_handler(sig);
+        WCP_ABORT("default signal %d handler should have killed me ...", sig);
+    }
+    siglongjmp(wcp_current.try_bufs[wcp_current.try_depth - 1], 1);
+}
+
+static void
+wcp_handle_sample(int sig, siginfo_t *info, struct ucontext *ucontext)
+{
+    PyThreadState *tstate = wcp_current_tstate();
+    WCP_LOG(WCP_DEBUG, "SIGPROF - tstate is %p", tstate);
+}
+
+static void
+wcp_handle_signal(int sig, siginfo_t *info, void *context_void)
+{
+    struct ucontext *ucontext = context_void;
+    switch (sig) {
+        case SIGBUS:
+        case SIGSEGV:
+            wcp_handle_fault(sig, info, ucontext);
+            break;
+        case SIGPROF:
+            wcp_handle_sample(sig, info, ucontext);
+            break;
+        default:
+            WCP_ABORT("unexpected signal: %d", sig);
+    }
+}
+
+static void
+wcp_register_signal_handler(int sig, int sa_flags)
+{
+    struct sigaction act;
+    act.sa_sigaction = wcp_handle_signal;
+    act.sa_flags = sa_flags | SA_SIGINFO;
+
+    if (sigemptyset(&act.sa_mask))
+        wcp_raise_os_error("sigemptyset: %r");
+
+    if (sigaddset(&act.sa_mask, SIGPROF))
+        wcp_raise_os_error("sigaddset: %r");
+
+    if (sigaction(sig, &act, NULL))
+        wcp_raise_os_error("sigaction: %r");
+}
+
+static void
+wcp_unregister_signal_handler(int sig)
+{
+    if (signal(sig, SIG_DFL) == SIG_ERR)
+        WCP_ABORT("signal: %r");
+}
+
+static PyObject *
+wcp_setup(PyObject *self, PyObject *args)
+{
+    struct itimerval timer;
+    long sec, usec;
+
+    if (!PyArg_ParseTuple(args, "ll", &sec, &usec))
+        return NULL;
+
+    timer.it_value.tv_sec = sec;
+    timer.it_value.tv_usec = usec;
+    timer.it_interval = timer.it_value;
+
+    wcp_register_signal_handler(SIGPROF, SA_RESTART);
+    if (PyErr_Occurred())
+        return NULL;
+
+    if (setitimer(ITIMER_PROF, &timer, NULL))
+        return wcp_raise_os_error("setitimer: %r");
+
+    Py_RETURN_NONE;
+}
+
+#define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+
+static char
+wcp_read(const char *c)
+{
+    return ACCESS_ONCE(*c);
+}
+
+static char
+wcp_try_read_except(const char *c, char except)
+{
+    return WCP_TRY_EXCEPT(wcp_read(c), except);
+}
+
+
+static PyObject *
+wcp_test_fault_handling(PyObject *self, PyObject *args)
+{
+    int fd;
+    char path[] = {"/tmp/XXXXXX"};
+    char *m;
+    char c;
+    int status;
+    pid_t child;
+
+    if (!PyArg_ParseTuple(args, ""))
+        return NULL;
+
+    /* SIGSEGV */
+    WCP_ASSERT(wcp_try_read_except(NULL, 'a') == 'a');
+
+    /* SIGBUS */
+    fd = mkstemp(path);
+    WCP_ASSERT(fd != -1);
+    WCP_ASSERT(!unlink(path));
+    m = (char *) mmap(NULL, PAGE_SIZE, PROT_WRITE | PROT_READ,
+                      MAP_PRIVATE, fd, 0);
+    WCP_ASSERT(m != MAP_FAILED);
+    WCP_ASSERT(wcp_try_read_except(m, 'a') == 'a');
+    WCP_ASSERT(!munmap(m, PAGE_SIZE));
+    WCP_ASSERT(!close(fd));
+
+    /* Nested. */
+    c = WCP_TRY_EXCEPT(wcp_try_read_except(NULL, 'a'), 'b');
+    WCP_ASSERT(c == 'a');
+
+    /* Fault in except expression. */
+    c = WCP_TRY_EXCEPT(wcp_read(NULL), wcp_try_read_except(NULL, 'a'));
+    WCP_ASSERT(c == 'a');
+
+    /* Make sure we die if we're not expecting a fault. */
+    child = fork();
+    if (child == 0) {
+        wcp_read(NULL);
+        exit(0);
+    }
+    WCP_ASSERT(child != -1);
+    WCP_ASSERT(waitpid(child, &status, 0) == child);
+    WCP_ASSERT(WIFSIGNALED(status));
+    WCP_ASSERT(WTERMSIG(status) == SIGSEGV);
+    WCP_LOG(WCP_INFO, "^^^ good, child %d killed by signal %d :-)", child, SIGSEGV);
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+wcp_set_log_level(PyObject *self, PyObject *args)
+{
+    int level;
+    if (!PyArg_ParseTuple(args, "i", &level))
+        return NULL;
+
+    if (level < WCP_ERROR || level > WCP_DEBUG)
+        return PyErr_Format(PyExc_ValueError, "log level %d out of bounds",
+                            level);
+
+    wcp_log_level = level;
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+wcp_get_log_level(PyObject *self, PyObject *args)
+{
+    if (!PyArg_ParseTuple(args, ""))
+        return NULL;
+    return PyInt_FromLong(wcp_log_level);
+}
+
+static PyObject *
+wcp_set_log_fd(PyObject *self, PyObject *args)
+{
+    long fd;
+    if (!PyArg_ParseTuple(args, "l", &fd))
+        return NULL;
+
+    wcp_log_fd = fd;
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+wcp_get_log_fd(PyObject *self, PyObject *args)
+{
+    if (!PyArg_ParseTuple(args, ""))
+        return NULL;
+    return PyInt_FromLong(wcp_log_fd);
+}
+
 static PyMethodDef ProfMethods[] = {
 /*
     {"start", prof_start, METH_VARARGS, "Start profiling."},
     {"stop", prof_stop, METH_VARARGS, "Stop profiling."},
     */
-    {"get_thread_id", wcp_get_thread_id, METH_VARARGS, "Stop profiling."},
+    {"setup", wcp_setup, METH_VARARGS, "Setup profiling."},
+    {"get_thread_id", wcp_get_thread_id, METH_VARARGS, "Get current thread id."},
+    {"test_fault_handling", wcp_test_fault_handling, METH_VARARGS, ""},
+    {"get_log_level", wcp_get_log_level, METH_VARARGS, ""},
+    {"set_log_level", wcp_set_log_level, METH_VARARGS, ""},
+    {"set_log_fd", wcp_set_log_fd, METH_VARARGS, ""},
+    {"get_log_fd", wcp_get_log_fd, METH_VARARGS, ""},
     {NULL, NULL, 0, NULL}
 };
 
 PyMODINIT_FUNC
-init_prof(void)
+init_wcp(void)
 {
-    (void) Py_InitModule("_prof", ProfMethods);
+    PyObject *self;
+    PyObject *v;
+    int r;
+
+    wcp_register_signal_handler(SIGSEGV, 0);
+    if (PyErr_Occurred())
+        goto error;
+
+    wcp_register_signal_handler(SIGBUS, 0);
+    if (PyErr_Occurred())
+        goto error_sigsegv;
+
+    self = Py_InitModule("_wcp", ProfMethods);
+    if (!self)
+        goto error_sigbus;
+
+#define EXPORT_LOG_LEVEL(level)\
+    v = PyInt_FromLong(WCP_ ##level);\
+    if (!v)\
+        goto error_sigbus;\
+    r = PyObject_SetAttrString(self, #level, v);\
+    Py_DecRef(v);\
+    if (r == -1)\
+        goto error_sigbus;
+    EXPORT_LOG_LEVEL(ERROR)
+    EXPORT_LOG_LEVEL(INFO)
+    EXPORT_LOG_LEVEL(DEBUG)
+#undef EXPORT_LOG_LEVEL
+
+out:
+    return;
+error_sigbus:
+    wcp_unregister_signal_handler(SIGBUS);
+error_sigsegv:
+    wcp_unregister_signal_handler(SIGSEGV);
+error:
+    goto out;
 }

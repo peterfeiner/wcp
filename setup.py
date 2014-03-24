@@ -1,8 +1,8 @@
 from distutils.core import setup, Extension
 
-extension = Extension('wcp._prof',
-                      sources=['prof.c'],
-                      extra_compile_args=['-O0'], 
+extension = Extension('wcp._wcp',
+                      sources=['wcp.c'],
+                      extra_compile_args=['-O0'],
                       libraries=['rt'])
 
 setup(name='wcp',

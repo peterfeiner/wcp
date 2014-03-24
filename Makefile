@@ -10,3 +10,4 @@ a.out: test.o
 
 clean:
 	rm -f test.o a.out
+	rm -rf build
