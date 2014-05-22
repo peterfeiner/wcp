@@ -1,3 +1,4 @@
+import thread
 import threading
 import pytest
 
@@ -32,3 +33,16 @@ def test_set_get_log_fd():
     assert _wcp.get_log_fd() == 2
     _wcp.set_log_fd(2)
     pytest.raises(TypeError, _wcp.set_log_fd, 'x')
+
+def test_get_thread_id():
+    assert thread.get_ident() == _wcp.get_thread_id()
+
+    ids = []
+    def main():
+        ids.append(thread.get_ident())
+        ids.append(_wcp.get_thread_id())
+    t = threading.Thread(target=main)
+    t.start()
+    t.join()
+    assert ids[0] != thread.get_ident()
+    assert ids[0] == ids[1]
