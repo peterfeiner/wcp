@@ -1,8 +1,10 @@
 #include <Python.h>
 #include <pythread.h>
+#include <frameobject.h>
 #ifndef _GNU_SOURCE
 #   define _GNU_SOURCE
 #endif
+#include <execinfo.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -530,7 +532,14 @@ static void
 wcp_handle_sample(int sig, siginfo_t *info, struct ucontext *ucontext)
 {
     PyThreadState *tstate = wcp_current_tstate();
+    PyFrameObject *frame = tstate->frame;
     WCP_LOG(WCP_DEBUG, "SIGPROF - tstate is %p", tstate);
+    for (frame = tstate->frame; frame; frame = frame->f_back) {
+        WCP_LOG(WCP_DEBUG, "%s:%d in %s",
+                PyString_AsString(frame->f_code->co_filename),
+                PyFrame_GetLineNumber(frame),
+                PyString_AsString(frame->f_code->co_name));
+    }
 }
 
 static void
